@@ -19,7 +19,7 @@ from tensorflow.keras.optimizers import SGD, Adam, RMSprop
 from tensorflow.keras.utils import normalize
 from tensorflow.keras.regularizers import l2
 import tensorflow.keras.layers as kl
-from tensorflow.keras.utils import Sequence
+from tensorflow.keras.utils import Sequence, to_categorical
 
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from tensorflow.keras import backend as K
@@ -37,22 +37,34 @@ BCHSIZE = 200  # Batch size
 EPOCH = 500  # Epochs
 LR = 1e-6  # Learning rate
 AVK = True  # Include averaging kernels as input
-FLAG = 2
 
 
+DOFTHRESH = 1.5  # dof threshold for flagging
+CHISQTHRESH = 40  # chisq threshold for flagging
 # Choose threshold combination for data filtering
-# 1 - dof > 1.5 & chisq < 40 (best)
-# 2 - dof < 1.5 & chisq > 40 (worst)
-# 3 - dof > 1.5 & chisq > 40
-# 4 - dof < 1.5 & chisq < 40
+# 1 - dof >= 1.5 & chisq <= 40 (best)
+# 2 - dof >= 1.5 & chisq > 40
+# 3 - dof < 1.5 & chisq <= 40
+# 4 - dof < 1.5 & chisq > 40 (worst)
 
+def get_flag(dof, chisq):
+	flag = -1
+	if dof >= DOFTHRESH and chisq <= CHISQTHRESH:
+		flag = 0
+	elif dof >= DOFTHRESH and chisq > CHISQTHRESH:
+		flag = 1
+	elif dof < DOFTHRESH and chisq <= CHISQTHRESH:
+		flag = 2
+	elif dof < DOFTHRESH and chisq > CHISQTHRESH:
+		flag = 3
+	return flag
 
 def r2_keras(y_true, y_pred):
     y_t = tf.multiply(y_true, tf.cast(tf.not_equal(y_true, 0), tf.float32))
     y_p = tf.multiply(y_pred, tf.cast(tf.not_equal(y_true, 0), tf.float32))
     SS_res = K.sum(K.square(y_t - y_p))
     SS_tot = K.sum(K.square(y_t - K.mean(y_t)))
-    return (1 - SS_res / (SS_tot + K.epsilon()))
+    return 1 - SS_res / (SS_tot + K.epsilon())
 
 
 class data_generator(Sequence):
@@ -91,7 +103,11 @@ class data_generator(Sequence):
 
         tempy = np.stack([np.load(s)['aero'] for s in batch_y])[:, :, np.newaxis]  # batch
 
-        return [tempx1, tempx2], tempy
+        flag = [ get_flag(np.load(s)['dof'], np.load(s)['chisq']) for s in batch_y]
+        flag = to_categorical(flag, num_classes=4)
+
+
+        return [tempx1, tempx2], [tempy, flag]
 
 
 def data_split(x, y, ratio1, ratio2, maskname=None):
@@ -153,13 +169,9 @@ def outname(inname):
 
 preset_mask = False  # wether to load previous mask
 
-if FLAG == 0:
-    xfiles = np.array(sorted(glob.glob(INPATH + 'X/X_*.npz')))
-    yfiles = np.array(sorted(glob.glob(INPATH + 'Y/Y_*.npz')))
+xfiles = np.array(sorted(glob.glob(INPATH + 'X/X_*.npz')))
+yfiles = np.array(sorted(glob.glob(INPATH + 'Y/Y_*.npz')))
 
-else:
-    xfiles = np.array(sorted(glob.glob(INPATH + 'X_flag%s/X_*.npz' % FLAG)))
-    yfiles = np.array(sorted(glob.glob(INPATH + 'Y_flag%s/Y_*.npz' % FLAG)))
 
 if preset_mask:
 
@@ -202,15 +214,15 @@ else:
 prof_input = Input((input_size), name='rean_input')
 meas_input = Input((9, 7), name='meas_input')
 
-pc1 = Conv1D(36, 2, strides=1, padding='same', activation="relu")(meas_input)
-pc1 = Conv1D(36, 2, strides=1, padding='same', activation="relu")(pc1)
-pd1 = Dense(36, activation="relu")(pc1) # 36
-pc2 = Conv1D(128, 2, strides=1, padding='same', activation="relu")(pd1)
-pc2 = Conv1D(128, 2, strides=1, padding='same', activation="relu")(pc2)
-pd2 = Dense(128, activation="relu")(pc2) # 128
-pc3 = Conv1D(256, 2, strides=1, padding='same', activation="relu")(pd2)
-pc3 = Conv1D(256, 2, strides=1, padding='same', activation="relu")(pc3)
-pd3 = Dense(256, activation="relu")(pc3) # 21
+pc1 = Conv1D(36, 2, strides=1, padding='same', activation="relu")(meas_input)  # 9, 36
+pc1 = Conv1D(36, 2, strides=1, padding='same', activation="relu")(pc1)         # 9, 36
+pd1 = Dense(36, activation="relu")(pc1) # 9, 36
+pc2 = Conv1D(128, 2, strides=1, padding='same', activation="relu")(pd1)        # 9, 128
+pc2 = Conv1D(128, 2, strides=1, padding='same', activation="relu")(pc2)        # 9, 128
+pd2 = Dense(128, activation="relu")(pc2) # 9, 128
+pc3 = Conv1D(256, 2, strides=1, padding='same', activation="relu")(pd2)        # 9, 256
+pc3 = Conv1D(256, 2, strides=1, padding='same', activation="relu")(pc3)        # 9, 256
+pd3 = Dense(256, activation="relu")(pc3) # 9, 256
 
 lstm = LSTM(21, name='LSTM1') (pd3)  # this gives a pseudo profile
 lstm = kl.Reshape((21, 1)) (lstm)
@@ -231,10 +243,24 @@ p3 = Dense(128, activation="relu") (c3)   # 21, 128
 
 u = concatenate([p1, p2, p3])   # 21, 5
 
-output = Dense(1, activation="linear")(u) # 1
+output = Dense(1, activation="linear", name='Profile_regressor')(u) # 1
+
+# define the classifier branch
+measf = Flatten()(meas_input)
+prof_f = Flatten()(prof_input)
+pd1f = Flatten()(pd1)
+pd2f = Flatten()(pd2)
+pd3f = Flatten()(pd3)
+p1f = Flatten()(p1)
+p2f = Flatten()(p2)
+p3f = Flatten()(p3)
+classinput = concatenate([measf, prof_f, pd1f, pd2f, pd3f, p1f, p2f, p3f])  # 12012
+ch1 = Dense(512, activation="relu") (classinput)   # 512
+ch2 = Dense(64, activation="relu") (ch1)   # 64
+classoutput = Dense(4, activation="relu", name='QF_classifier') (ch2)   # 4
 
 # define a model with a list of two inputs
-model = Model(inputs=[meas_input, prof_input], outputs=output)
+model = Model(inputs=[meas_input, prof_input], outputs=[output, classoutput])
 
 
 opt = Adam(learning_rate = LR)
@@ -251,7 +277,7 @@ ep_complete = 0
 load_weights = False
 
 if load_weights:
-    model_path = "../input/pandora/saved_models/DLMAXDOAS_flag%s_ep%s.h5" % (FLAG, ep_complete)
+    model_path = "../input/pandora/saved_models/DLMAXDOAS_ep%s.h5" % (ep_complete)
     model.load_weights(model_path)
 
     print("Evaluation of pre-trained model for train set:")
@@ -268,7 +294,7 @@ if load_weights:
 results = model.fit(train_generator,
                     validation_data=valid_generator, epochs=EPOCH,
                     callbacks=[earlystopper, checkpointer, csv_logger])
-model.save('DLMAXDOAS_flag%s_ep%s.h5' % (FLAG, ep_complete+EPOCH))
+model.save('DLMAXDOAS_ep%s.h5' % (ep_complete+EPOCH))
 
 print("Evaluation of trained model for train set:")
 print(model.evaluate(train_generator))
